@@ -11,33 +11,30 @@ module launchpad_addr::launchpad {
     use aptos_framework::fungible_asset::{Self, Metadata};
     use aptos_framework::object::{Self, Object, ObjectCore, ExtendRef};
     use aptos_framework::primary_fungible_store;
+    use aptos_framework::timestamp;
 
-    /// Only admin can update creator
+    /// Existing error codes from launchpad
     const EONLY_ADMIN_CAN_UPDATE_CREATOR: u64 = 1;
-    /// Only admin can set pending admin
     const EONLY_ADMIN_CAN_SET_PENDING_ADMIN: u64 = 2;
-    /// Sender is not pending admin
     const ENOT_PENDING_ADMIN: u64 = 3;
-    /// Only admin can update mint fee collector
     const EONLY_ADMIN_CAN_UPDATE_MINT_FEE_COLLECTOR: u64 = 4;
-    /// Only admin or creator can create fungible asset
     const EONLY_ADMIN_OR_CREATOR_CAN_CREATE_FA: u64 = 5;
-    /// No mint limit
     const ENO_MINT_LIMIT: u64 = 6;
-    /// Mint limit reached
     const EMINT_LIMIT_REACHED: u64 = 7;
-    /// Only admin can update mint enabled
     const EONLY_ADMIN_CAN_UPDATE_MINT_ENABLED: u64 = 8;
-    /// Mint is disabled
     const EMINT_IS_DISABLED: u64 = 9;
-    /// Cannot mint 0 amount
     const ECANNOT_MINT_ZERO: u64 = 10;
 
-    /// Default to mint 0 amount to creator when creating FA
+    /// New error codes adapted from credit_system
+    const EINSUFFICIENT_BALANCE: u64 = 11;
+    const ENOT_INITIALIZED: u64 = 12;
+    const EWRONG_ASSET: u64 = 13;
+
+    /// Default constants from launchpad
     const DEFAULT_PRE_MINT_AMOUNT: u64 = 0;
-    /// Default mint fee per smallest unit of FA denominated in oapt (smallest unit of APT, i.e. 1e-8 APT)
     const DEFAULT_mint_fee_per_smallest_unit_of_fa: u64 = 0;
 
+    /// Existing event structs
     #[event]
     struct CreateFAEvent has store, drop {
         creator_addr: address,
@@ -62,32 +59,24 @@ module launchpad_addr::launchpad {
         total_mint_fee: u64,
     }
 
-    /// Unique per FA
-    /// We need this object to own the FA object instead of contract directly owns the FA object
-    /// This helps us avoid address collision when we create multiple FAs with same name
+    /// Existing structs
     struct FAOwnerObjConfig has key {
         fa_obj: Object<Metadata>,
         extend_ref: ExtendRef,
     }
 
-    /// Unique per FA
     struct FAController has key {
         mint_ref: fungible_asset::MintRef,
         burn_ref: fungible_asset::BurnRef,
         transfer_ref: fungible_asset::TransferRef,
     }
 
-    /// Unique per FA
     struct MintLimit has store {
         limit: u64,
-        // key is minter address, value is how many tokens minter left to mint
-        // e.g. mint limit is 3, minter has minted 2, mint balance should be 1
         mint_balance_tracker: Table<address, u64>,
     }
 
-    /// Unique per FA
     struct FAConfig has key {
-        // Mint fee per FA denominated in oapt (smallest unit of APT, i.e. 1e-8 APT)
         mint_fee_per_smallest_unit_of_fa: u64,
         mint_limit: Option<MintLimit>,
         mint_enabled: bool,
@@ -95,23 +84,39 @@ module launchpad_addr::launchpad {
         extend_ref: ExtendRef,
     }
 
-    /// Global per contract
     struct Registry has key {
         fa_objects: vector<Object<Metadata>>,
     }
 
-    /// Global per contract
     struct Config has key {
-        // creator can create FA
         creator_addr: address,
-        // admin can set pending admin, accept admin, update mint fee collector, create FA and update creator
         admin_addr: address,
         pending_admin_addr: Option<address>,
         mint_fee_collector_addr: address,
     }
 
-    /// If you deploy the module under an object, sender is the object's signer
-    /// If you deploy the moduelr under your own account, sender is your account's signer
+    /// New structs for credit system
+    struct TransactionHistory has store, drop {
+        sender: address,
+        receiver: address,
+        amount: u64,
+        timestamp: u64
+    }
+
+    #[event]
+    struct TransferEvent has drop, store {
+        sender: address,
+        receiver: address,
+        amount: u64
+    }
+
+    struct CreditAccount has key {
+        fa_obj: Object<Metadata>,
+        balance: fungible_asset::Holder<Metadata>,
+        transactions: vector<TransactionHistory>,
+    }
+
+    /// Existing initialization
     fun init_module(sender: &signer) {
         move_to(sender, Registry {
             fa_objects: vector::empty()
@@ -124,9 +129,8 @@ module launchpad_addr::launchpad {
         });
     }
 
-    // ================================= Entry Functions ================================= //
+    // ================================= Existing Entry Functions ================================= //
 
-    /// Update creator address
     public entry fun update_creator(sender: &signer, new_creator: address) acquires Config {
         let sender_addr = signer::address_of(sender);
         let config = borrow_global_mut<Config>(@launchpad_addr);
@@ -134,7 +138,6 @@ module launchpad_addr::launchpad {
         config.creator_addr = new_creator;
     }
 
-    /// Set pending admin of the contract, then pending admin can call accept_admin to become admin
     public entry fun set_pending_admin(sender: &signer, new_admin: address) acquires Config {
         let sender_addr = signer::address_of(sender);
         let config = borrow_global_mut<Config>(@launchpad_addr);
@@ -142,7 +145,6 @@ module launchpad_addr::launchpad {
         config.pending_admin_addr = option::some(new_admin);
     }
 
-    /// Accept admin of the contract
     public entry fun accept_admin(sender: &signer) acquires Config {
         let sender_addr = signer::address_of(sender);
         let config = borrow_global_mut<Config>(@launchpad_addr);
@@ -151,7 +153,6 @@ module launchpad_addr::launchpad {
         config.pending_admin_addr = option::none();
     }
 
-    /// Update mint fee collector address
     public entry fun update_mint_fee_collector(sender: &signer, new_mint_fee_collector: address) acquires Config {
         let sender_addr = signer::address_of(sender);
         let config = borrow_global_mut<Config>(@launchpad_addr);
@@ -159,8 +160,7 @@ module launchpad_addr::launchpad {
         config.mint_fee_collector_addr = new_mint_fee_collector;
     }
 
-    /// Update mint enabled
-    public entry fun update_mint_enabled(sender: &signer, fa_obj: Object<Metadata>, enabled: bool) acquires Config, FAConfig{
+    public entry fun update_mint_enabled(sender: &signer, fa_obj: Object<Metadata>, enabled: bool) acquires Config, FAConfig {
         let sender_addr = signer::address_of(sender);
         let config = borrow_global_mut<Config>(@launchpad_addr);
         assert!(is_admin(config, sender_addr), EONLY_ADMIN_CAN_UPDATE_MINT_ENABLED);
@@ -169,21 +169,16 @@ module launchpad_addr::launchpad {
         fa_config.mint_enabled = enabled;
     }
 
-    /// Create a fungible asset, only admin or creator can create FA
     public entry fun create_fa(
         sender: &signer,
         max_supply: Option<u128>,
         name: String,
         symbol: String,
-        // Number of decimal places, i.e. APT has 8 decimal places, so decimals = 8, 1 APT = 1e-8 oapt
         decimals: u8,
         icon_uri: String,
         project_uri: String,
-        // Mint fee per smallest unit of FA denominated in oapt (smallest unit of APT, i.e. 1e-8 APT)
         mint_fee_per_smallest_unit_of_fa: Option<u64>,
-        // Amount in smallest unit of FA
         pre_mint_amount: Option<u64>,
-        // Limit of minting per address in smallest unit of FA
         mint_limit_per_addr: Option<u64>,
     ) acquires Registry, Config, FAController {
         let sender_addr = signer::address_of(sender);
@@ -267,7 +262,6 @@ module launchpad_addr::launchpad {
         }
     }
 
-    /// Mint fungible asset, anyone with enough mint fee and has not reached mint limit can mint FA
     public entry fun mint_fa(
         sender: &signer,
         fa_obj: Object<Metadata>,
@@ -282,45 +276,106 @@ module launchpad_addr::launchpad {
         mint_fa_internal(sender, fa_obj, amount, total_mint_fee);
     }
 
-    // ================================= View Functions ================================== //
+    // ================================= New Credit System Entry Functions ================================= //
+
+    /// Initialize credit account for a user with a specific fungible asset
+    public entry fun initialize_account(sender: &signer, fa_obj: Object<Metadata>) {
+        let credit_account = CreditAccount {
+            fa_obj,
+            balance: fungible_asset::create_holder(&fa_obj),
+            transactions: vector::empty<TransactionHistory>()
+        };
+        move_to(sender, credit_account);
+    }
+
+    /// Deposit fungible assets into the credit account
+    public entry fun deposit(sender: &signer, fa_obj: Object<Metadata>, amount: u64) acquires CreditAccount {
+        let sender_addr = signer::address_of(sender);
+        assert!(exists<CreditAccount>(sender_addr), ENOT_INITIALIZED);
+
+        let credit_account = borrow_global_mut<CreditAccount>(sender_addr);
+        assert!(credit_account.fa_obj == fa_obj, EWRONG_ASSET);
+
+        let coins = primary_fungible_store::withdraw(sender, fa_obj, amount);
+        fungible_asset::deposit(&mut credit_account.balance, coins);
+    }
+
+    /// Transfer fungible assets between credit accounts
+    public entry fun transfer(
+        sender: &signer,
+        receiver_addr: address,
+        fa_obj: Object<Metadata>,
+        amount: u64
+    ) acquires CreditAccount {
+        let sender_addr = signer::address_of(sender);
+        
+        // Check if both accounts exist
+        assert!(exists<CreditAccount>(sender_addr), ENOT_INITIALIZED);
+        assert!(exists<CreditAccount>(receiver_addr), ENOT_INITIALIZED);
+
+        // Check sender's account and balance
+        let sender_account = borrow_global_mut<CreditAccount>(sender_addr);
+        assert!(sender_account.fa_obj == fa_obj, EWRONG_ASSET);
+        assert!(fungible_asset::balance(&sender_account.balance) >= amount, EINSUFFICIENT_BALANCE);
+
+        // Perform transfer
+        let coins = fungible_asset::withdraw(&mut sender_account.balance, amount);
+        let receiver_account = borrow_global_mut<CreditAccount>(receiver_addr);
+        assert!(receiver_account.fa_obj == fa_obj, EWRONG_ASSET);
+        fungible_asset::deposit(&mut receiver_account.balance, coins);
+
+        // Record transaction
+        let transaction = TransactionHistory {
+            sender: sender_addr,
+            receiver: receiver_addr,
+            amount,
+            timestamp: timestamp::now_seconds()
+        };
+
+        vector::push_back(&mut sender_account.transactions, copy transaction);
+        vector::push_back(&mut receiver_account.transactions, transaction);
+
+        // Emit event
+        event::emit(TransferEvent {
+            sender: sender_addr,
+            receiver: receiver_addr,
+            amount
+        });
+    }
+
+    // ================================= Existing View Functions ================================== //
 
     #[view]
-    /// Get creator, creator is the address that is allowed to create FAs
     public fun get_creator(): address acquires Config {
         let config = borrow_global<Config>(@launchpad_addr);
         config.creator_addr
     }
 
     #[view]
-    /// Get contract admin
     public fun get_admin(): address acquires Config {
         let config = borrow_global<Config>(@launchpad_addr);
         config.admin_addr
     }
 
     #[view]
-    /// Get contract pending admin
     public fun get_pending_admin(): Option<address> acquires Config {
         let config = borrow_global<Config>(@launchpad_addr);
         config.pending_admin_addr
     }
 
     #[view]
-    /// Get mint fee collector address
     public fun get_mint_fee_collector(): address acquires Config {
         let config = borrow_global<Config>(@launchpad_addr);
         config.mint_fee_collector_addr
     }
 
     #[view]
-    /// Get all fungible assets created using this contract
     public fun get_registry(): vector<Object<Metadata>> acquires Registry {
         let registry = borrow_global<Registry>(@launchpad_addr);
         registry.fa_objects
     }
 
     #[view]
-    /// Get fungible asset metadata
     public fun get_fa_objects_metadatas(
         fa_obj: Object<Metadata>
     ): (String, String, u8) {
@@ -331,7 +386,6 @@ module launchpad_addr::launchpad {
     }
 
     #[view]
-    /// Get mint limit per address
     public fun get_mint_limit(
         fa_obj: Object<Metadata>,
     ): Option<u64> acquires FAConfig {
@@ -344,8 +398,6 @@ module launchpad_addr::launchpad {
     }
 
     #[view]
-    /// Get mint balance, i.e. how many tokens user can mint
-    /// e.g. If the mint limit is 1, user has already minted 1, balance is 0
     public fun get_mint_balance(
         fa_obj: Object<Metadata>,
         addr: address
@@ -358,10 +410,8 @@ module launchpad_addr::launchpad {
     }
 
     #[view]
-    /// Get mint fee denominated in oapt (smallest unit of APT, i.e. 1e-8 APT)
     public fun get_mint_fee(
         fa_obj: Object<Metadata>,
-        // Amount in smallest unit of FA
         amount: u64,
     ): u64 acquires FAConfig {
         let fa_config = borrow_global<FAConfig>(object::object_address(&fa_obj));
@@ -369,16 +419,32 @@ module launchpad_addr::launchpad {
     }
 
     #[view]
-    /// Is mint enabled for the fa
     public fun is_mint_enabled(fa_obj: Object<Metadata>): bool acquires FAConfig {
         let fa_addr = object::object_address(&fa_obj);
         let fa_config = borrow_global<FAConfig>(fa_addr);
         fa_config.mint_enabled
     }
 
-    // ================================= Helper Functions ================================== //
+    // ================================= New Credit System View Functions ================================= //
 
-    /// Check if sender is admin or owner of the object when package is published to object
+    #[view]
+    public fun get_balance(addr: address, fa_obj: Object<Metadata>): u64 acquires CreditAccount {
+        assert!(exists<CreditAccount>(addr), ENOT_INITIALIZED);
+        let account = borrow_global<CreditAccount>(addr);
+        assert!(account.fa_obj == fa_obj, EWRONG_ASSET);
+        fungible_asset::balance(&account.balance)
+    }
+
+    #[view]
+    public fun get_transaction_count(addr: address, fa_obj: Object<Metadata>): u64 acquires CreditAccount {
+        assert!(exists<CreditAccount>(addr), ENOT_INITIALIZED);
+        let account = borrow_global<CreditAccount>(addr);
+        assert!(account.fa_obj == fa_obj, EWRONG_ASSET);
+        vector::length(&account.transactions)
+    }
+
+    // ================================= Existing Helper Functions ================================== //
+
     fun is_admin(config: &Config, sender: address): bool {
         if (sender == config.admin_addr) {
             true
@@ -392,12 +458,10 @@ module launchpad_addr::launchpad {
         }
     }
 
-    /// Check if sender is allowed to create FA
     fun is_creator(config: &Config, sender: address): bool {
         sender == config.creator_addr
     }
 
-    /// Check mint limit and update mint tracker
     fun check_mint_limit_and_update_mint_tracker(
         sender: address,
         fa_obj: Object<Metadata>,
@@ -416,7 +480,6 @@ module launchpad_addr::launchpad {
         }
     }
 
-    /// ACtual implementation of minting FA
     fun mint_fa_internal(
         sender: &signer,
         fa_obj: Object<Metadata>,
@@ -437,7 +500,6 @@ module launchpad_addr::launchpad {
         });
     }
 
-    /// Pay for mint
     fun pay_for_mint(
         sender: &signer,
         total_mint_fee: u64
@@ -448,10 +510,47 @@ module launchpad_addr::launchpad {
         }
     }
 
-    // ================================= Uint Tests ================================== //
+    // ================================= Unit Tests ================================== //
 
     #[test_only]
     public fun init_module_for_test(sender: &signer) {
         init_module(sender);
+    }
+
+    #[test(sender = @0x1, receiver = @0x2)]
+    public entry fun test_credit_system(sender: &signer, receiver: &signer) acquires CreditAccount, Config, Registry, FAController, FAConfig {
+        // Initialize module
+        init_module_for_test(sender);
+
+        // Create a fungible asset
+        create_fa(
+            sender,
+            option::none(),
+            string::utf8(b"TestToken"),
+            string::utf8(b"TTK"),
+            6,
+            string::utf8(b""),
+            string::utf8(b""),
+            option::none(),
+            option::some(1000),
+            option::none()
+        );
+
+        let fa_obj = vector::borrow(&borrow_global<Registry>(@launchpad_addr).fa_objects, 0);
+
+        // Initialize accounts
+        initialize_account(sender, *fa_obj);
+        initialize_account(receiver, *fa_obj);
+
+        // Deposit tokens
+        deposit(sender, *fa_obj, 1000);
+
+        // Transfer tokens
+        transfer(sender, signer::address_of(receiver), *fa_obj, 500);
+
+        // Verify balances and transaction count
+        assert!(get_balance(signer::address_of(sender), *fa_obj) == 500, 1);
+        assert!(get_balance(signer::address_of(receiver), *fa_obj) == 500, 2);
+        assert!(get_transaction_count(signer::address_of(sender), *fa_obj) == 1, 3);
     }
 }
